@@ -6,6 +6,8 @@ const mocks = vi.hoisted(() => ({
   documentUri: "file:///documents",
   pickFile: vi.fn(),
   pickMedia: vi.fn(),
+  takePhoto: vi.fn(),
+  requestCamera: vi.fn(),
   copy: vi.fn(),
   delete: vi.fn(),
   open: vi.fn(),
@@ -80,7 +82,11 @@ vi.mock("expo-file-system", () => {
   };
 });
 
-vi.mock("expo-image-picker", () => ({ launchImageLibraryAsync: mocks.pickMedia }));
+vi.mock("expo-image-picker", () => ({
+  launchImageLibraryAsync: mocks.pickMedia,
+  launchCameraAsync: mocks.takePhoto,
+  requestCameraPermissionsAsync: mocks.requestCamera,
+}));
 vi.mock("expo-document-picker", () => ({ getDocumentAsync: mocks.pickFile }));
 vi.mock("expo-image-manipulator", () => ({
   SaveFormat: { JPEG: "jpeg", PNG: "png", WEBP: "webp" },
@@ -103,6 +109,8 @@ describe("composer file attachments", () => {
     mocks.documentUri = "file:///documents";
     mocks.pickFile.mockReset();
     mocks.pickMedia.mockReset();
+    mocks.takePhoto.mockReset();
+    mocks.requestCamera.mockReset();
     mocks.copy.mockReset();
     mocks.delete.mockReset();
     mocks.open.mockReset();
@@ -315,6 +323,58 @@ describe("composer file attachments", () => {
         images: [],
         error: "Failed to read 'photo.HEIC'.",
       });
+    });
+  });
+
+  describe("camera photos", () => {
+    const photo: ImagePickerAsset = {
+      uri: "file:///cache/ImagePicker/capture.jpg",
+      type: "image",
+      fileName: "capture.jpg",
+      mimeType: "image/jpeg",
+      fileSize: 3,
+      width: 1,
+      height: 1,
+    };
+
+    it("attaches a captured photo without opening the library", async () => {
+      mocks.requestCamera.mockResolvedValue({ granted: true });
+      mocks.takePhoto.mockResolvedValue({ canceled: false, assets: [photo] });
+      mocks.readBase64.mockResolvedValue("YWJj");
+
+      const result = await pickComposerMedia({
+        existingCount: 0,
+        maxVideoBytes: 1024,
+        source: "camera",
+      });
+
+      expect(mocks.takePhoto).toHaveBeenCalledWith(
+        expect.objectContaining({ mediaTypes: ["images"] }),
+      );
+      expect(mocks.pickMedia).not.toHaveBeenCalled();
+      expect(result).toEqual({
+        attachments: [
+          expect.objectContaining({
+            type: "image",
+            name: "capture.jpg",
+            dataUrl: "data:image/jpeg;base64,YWJj",
+          }),
+        ],
+        error: null,
+      });
+    });
+
+    it("reports denied camera access instead of opening the camera", async () => {
+      mocks.requestCamera.mockResolvedValue({ granted: false });
+
+      const result = await pickComposerMedia({ existingCount: 0, source: "camera" });
+
+      expect(mocks.takePhoto).not.toHaveBeenCalled();
+      expect(result).toEqual({
+        attachments: [],
+        error: "Allow camera access for T3 Code in Settings to take photos.",
+      });
+      expect(isForegroundHandoffActive()).toBe(false);
     });
   });
 

@@ -408,10 +408,16 @@ export async function pickComposerImages(input: { readonly existingCount: number
   };
 }
 
-/** Videos use file uploads; omit maxVideoBytes for image-only destinations. */
+export type ComposerMediaSource = "library" | "camera";
+
+/**
+ * Videos use file uploads; omit maxVideoBytes for image-only destinations.
+ * The camera takes a single photo and never records video.
+ */
 export async function pickComposerMedia(input: {
   readonly existingCount: number;
   readonly maxVideoBytes?: number;
+  readonly source?: ComposerMediaSource;
 }): Promise<{
   readonly attachments: ReadonlyArray<DraftComposerAttachment>;
   readonly error: string | null;
@@ -439,21 +445,40 @@ export async function pickComposerMedia(input: {
   const endHandoff = beginForegroundHandoff();
   let result: Awaited<ReturnType<typeof imagePicker.launchImageLibraryAsync>>;
   try {
-    result = await imagePicker.launchImageLibraryAsync({
-      mediaTypes: input.maxVideoBytes === undefined ? ["images"] : ["images", "videos"],
-      allowsMultipleSelection: true,
-      selectionLimit: remainingSlots,
-      // Bytes stay in the picker's file until we know how much of them we need. Asking for
-      // base64 here made iOS decode and re-encode every camera photo at full resolution and
-      // hand JS a 10 MB+ string, which stalled the composer for seconds.
-      base64: false,
-      quality: 1,
-      shouldDownloadFromNetwork: true,
-    });
+    if (input.source === "camera") {
+      const permission = await imagePicker.requestCameraPermissionsAsync();
+      if (!permission.granted) {
+        return {
+          attachments: [],
+          error: "Allow camera access for T3 Code in Settings to take photos.",
+        };
+      }
+      result = await imagePicker.launchCameraAsync({
+        mediaTypes: ["images"],
+        base64: false,
+        quality: 1,
+      });
+    } else {
+      result = await imagePicker.launchImageLibraryAsync({
+        mediaTypes: input.maxVideoBytes === undefined ? ["images"] : ["images", "videos"],
+        allowsMultipleSelection: true,
+        selectionLimit: remainingSlots,
+        // Bytes stay in the picker's file until we know how much of them we need. Asking for
+        // base64 here made iOS decode and re-encode every camera photo at full resolution and
+        // hand JS a 10 MB+ string, which stalled the composer for seconds.
+        base64: false,
+        quality: 1,
+        shouldDownloadFromNetwork: true,
+      });
+    }
   } catch (error) {
+    const fallback =
+      input.source === "camera"
+        ? "Could not open the camera."
+        : "Could not open the photo library.";
     return {
       attachments: [],
-      error: error instanceof Error ? error.message : "Could not open the photo library.",
+      error: error instanceof Error ? error.message : fallback,
     };
   } finally {
     endHandoff();

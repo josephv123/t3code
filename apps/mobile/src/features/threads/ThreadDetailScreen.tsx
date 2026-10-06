@@ -88,7 +88,7 @@ import { useAppearancePreferences } from "../settings/appearance/AppearancePrefe
 import { collectProviderUsageLimits } from "@t3tools/shared/usageLimits";
 import type { ComposerEditorHandle } from "../../components/ComposerEditor";
 import type { StatusTone } from "../../components/StatusPill";
-import type { DraftComposerAttachment } from "../../lib/composerImages";
+import type { ComposerMediaSource, DraftComposerAttachment } from "../../lib/composerImages";
 import { RenderErrorBoundary, RenderFailureView } from "../../components/RenderErrorBoundary";
 import { CHAT_CONTENT_MAX_WIDTH, type LayoutVariant } from "../../lib/layout";
 import { editPendingThreadMessage } from "../../state/edit-pending-thread-message";
@@ -207,7 +207,7 @@ export interface ThreadDetailScreenProps {
   readonly onHeaderMaterialVisibilityChange?: (visible: boolean) => void;
   readonly onOpenConnectionEditor: () => void;
   readonly onChangeDraftMessage: (value: string) => void;
-  readonly onPickDraftMedia: () => Promise<void>;
+  readonly onPickDraftMedia: (source: ComposerMediaSource) => Promise<void>;
   readonly onPickDraftFiles: () => Promise<void>;
   readonly onNativePasteImages: (uris: ReadonlyArray<string>) => Promise<void>;
   readonly onNativePasteText: (paste: ComposerTextPaste) => Promise<void>;

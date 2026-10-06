@@ -18,6 +18,9 @@ const personalTeamBundleIdentifier = repoEnv.T3CODE_IOS_PERSONAL_TEAM_BUNDLE_ID?
 const IOS_BUNDLE_IDENTIFIER_PATTERN = /^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/;
 
 const fromRepoRoot = (relativePath: string) => `../../${relativePath}`;
+// expo-camera and expo-image-picker both write NSCameraUsageDescription.
+const CAMERA_PERMISSION =
+  "Allow T3 Code to access your camera so you can take photos to attach and scan pairing QR codes.";
 // Android layers are rendered by scripts/export-android-icons.ts from the Icon Composer sources.
 // The wordmark sits inside the adaptive safe zone; the variant artwork is a full-bleed background.
 const androidAdaptiveForeground = "./assets/android-icon-foreground.png";
@@ -386,13 +389,20 @@ const config: ExpoConfig = {
     [
       "expo-camera",
       {
-        cameraPermission: "Allow T3 Code to access your camera so you can scan pairing QR codes.",
+        cameraPermission: CAMERA_PERMISSION,
         microphonePermission: false,
         barcodeScannerEnabled: true,
         recordAudioAndroid: false,
       },
     ],
-    ["expo-image-picker", { photosPermission: false, microphonePermission: false }],
+    [
+      "expo-image-picker",
+      {
+        photosPermission: false,
+        cameraPermission: CAMERA_PERMISSION,
+        microphonePermission: false,
+      },
+    ],
     [
       "expo-splash-screen",
       {
