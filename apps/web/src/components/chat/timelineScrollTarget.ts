@@ -38,10 +38,19 @@ export function isTimelineScrollTarget(
  * clamping, so an upward move while the content kept its height is the reader.
  */
 export function createUpwardScrollDetector(initial: { top: number; height: number }) {
-  let previous = initial;
+  let baseline = initial;
   return (next: { top: number; height: number }) => {
-    const movedUp = next.top < previous.top - 1 && next.height >= previous.height;
-    previous = next;
-    return movedUp;
+    // Shrinking content or a move toward the end starts a new measurement.
+    if (next.height < baseline.height || next.top > baseline.top) {
+      baseline = next;
+      return false;
+    }
+    if (next.top < baseline.top - 1) {
+      baseline = next;
+      return true;
+    }
+    // A slow scroll can move under a pixel per event; let those moves add up.
+    baseline = { top: baseline.top, height: next.height };
+    return false;
   };
 }

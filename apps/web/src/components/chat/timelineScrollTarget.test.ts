@@ -164,5 +164,14 @@ describe("createUpwardScrollDetector", () => {
   it("ignores subpixel jitter", () => {
     const scrolledUp = createUpwardScrollDetector({ top: 500.5, height: 2000 });
     expect(scrolledUp({ top: 500, height: 2000 })).toBe(false);
+    expect(scrolledUp({ top: 500.5, height: 2000 })).toBe(false);
+    expect(scrolledUp({ top: 500, height: 2000 })).toBe(false);
+  });
+
+  it("adds up a slow scroll that moves under a pixel per event", () => {
+    const scrolledUp = createUpwardScrollDetector({ top: 500, height: 2000 });
+    expect(scrolledUp({ top: 499.5, height: 2000 })).toBe(false);
+    expect(scrolledUp({ top: 499, height: 2000 })).toBe(false);
+    expect(scrolledUp({ top: 498.5, height: 2000 })).toBe(true);
   });
 });
