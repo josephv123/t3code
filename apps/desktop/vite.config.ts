@@ -75,6 +75,7 @@ export default defineConfig({
         "src/snapShot/GlobalShiftShortcutWorker.ts",
         "src/snapShot/RegionSnapShotWorker.ts",
         "src/snapShot/SnapShotAccessibilityWorker.ts",
+        "src/telemetry/MainThreadWatchdogWorker.ts",
       ],
       clean: false,
       deps: {

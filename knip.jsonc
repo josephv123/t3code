@@ -50,6 +50,7 @@
         "src/snapShot/GlobalShiftShortcutWorker.ts!",
         "src/snapShot/RegionSnapShotWorker.ts!",
         "src/snapShot/SnapShotAccessibilityWorker.ts!",
+        "src/telemetry/MainThreadWatchdogWorker.ts!",
         "src/boot.ts!",
         "src/compileCache.ts!",
         "src/main.ts!",
