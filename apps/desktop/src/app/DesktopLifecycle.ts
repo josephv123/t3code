@@ -1,6 +1,9 @@
 import * as Context from "effect/Context";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
@@ -57,8 +60,22 @@ export class DesktopLifecycle extends Context.Service<
   }
 >()("@t3tools/desktop/app/DesktopLifecycle") {}
 
-const { logInfo: logLifecycleInfo, logError: logLifecycleError } =
-  makeComponentLogger("desktop-lifecycle");
+const {
+  logInfo: logLifecycleInfo,
+  logWarning: logLifecycleWarning,
+  logError: logLifecycleError,
+} = makeComponentLogger("desktop-lifecycle");
+
+// Quitting waits for the window bounds write and for every shutdown finalizer,
+// the last of which stops the backends. Nothing bounds that wait as a whole (a
+// backend stop takes the instance lock before its own timeout starts), so past
+// this deadline the app exits without them rather than hold quit, or a macOS
+// logout, until the user force-quits. Keep it above the stop timeout in
+// DesktopApp.stopAllPoolInstances so a slow but healthy backend stop finishes.
+export const SHUTDOWN_DEADLINE = Duration.seconds(10);
+// app.exit() skips the finalizer that flushes the trace file, which is written
+// in one-second batches. Waiting out two batches keeps the deadline warning.
+export const SHUTDOWN_DEADLINE_LOG_FLUSH = Duration.seconds(2);
 
 function addScopedListener<Args extends ReadonlyArray<unknown>>(
   target: unknown,
@@ -81,18 +98,55 @@ function addScopedListener<Args extends ReadonlyArray<unknown>>(
   ).pipe(Effect.asVoid);
 }
 
+/** Succeeds with `false` when the shutdown missed `SHUTDOWN_DEADLINE`. */
 const requestDesktopShutdownAndWait = Effect.fn("desktop.lifecycle.requestShutdownAndWait")(
   function* (
     afterBoundsFlush: Effect.Effect<void> = Effect.void,
-  ): Effect.fn.Return<void, never, DesktopShutdown.DesktopShutdown | DesktopWindow.DesktopWindow> {
+  ): Effect.fn.Return<
+    boolean,
+    never,
+    DesktopShutdown.DesktopShutdown | DesktopWindow.DesktopWindow
+  > {
     const shutdown = yield* DesktopShutdown.DesktopShutdown;
     const desktopWindow = yield* DesktopWindow.DesktopWindow;
-    yield* desktopWindow.flushMainWindowBounds;
-    yield* afterBoundsFlush;
-    yield* shutdown.request;
-    yield* shutdown.awaitComplete;
+    let step = "saving window bounds";
+    // Await a fork rather than time the steps in place: a timeout waits for the
+    // effect it interrupts, so a stuck uninterruptible step would hold it too.
+    const steps = yield* Effect.forkDetach(
+      Effect.gen(function* () {
+        yield* desktopWindow.flushMainWindowBounds;
+        step = "closing windows";
+        yield* afterBoundsFlush;
+        step = "stopping backends and services";
+        yield* shutdown.request;
+        yield* shutdown.awaitComplete;
+      }),
+    );
+    const finished = Option.isSome(
+      yield* Fiber.join(steps).pipe(Effect.timeoutOption(SHUTDOWN_DEADLINE)),
+    );
+    if (!finished) {
+      // Its own span, so the warning is recorded before the exit that follows.
+      yield* logLifecycleWarning("shutdown missed its deadline; exiting anyway", {
+        step,
+        deadlineMs: Duration.toMillis(SHUTDOWN_DEADLINE),
+      }).pipe(Effect.withSpan("desktop.lifecycle.shutdownDeadline"));
+      // The stuck step may come before the request. Backends then still get
+      // their stop signal while the warning is written.
+      yield* shutdown.request;
+      yield* Effect.sleep(SHUTDOWN_DEADLINE_LOG_FLUSH);
+    }
+    return finished;
   },
 );
+
+// After a missed deadline the windows and quit listeners may still be in place,
+// and quit() would wait on them again. exit() closes windows without asking.
+const leaveAfterShutdown = (finished: boolean) =>
+  Effect.gen(function* () {
+    const electronApp = yield* ElectronApp.ElectronApp;
+    yield* finished ? electronApp.quit : electronApp.exit(0);
+  });
 
 function handleBeforeQuit(
   event: Electron.Event,
@@ -114,13 +168,14 @@ function handleBeforeQuit(
   }
 
   event.preventDefault();
+  let shutdownFinished = true;
   void runEffect(
     Effect.gen(function* () {
       const state = yield* DesktopState.DesktopState;
       const electronWindow = yield* ElectronWindow.ElectronWindow;
       yield* Ref.set(state.quitting, true);
       yield* logLifecycleInfo("before-quit received");
-      yield* requestDesktopShutdownAndWait(
+      shutdownFinished = yield* requestDesktopShutdownAndWait(
         electronWindow.destroyAll.pipe(
           Effect.catchCause((cause) =>
             logLifecycleError("failed to destroy windows before shutdown", { cause }),
@@ -131,10 +186,9 @@ function handleBeforeQuit(
   ).finally(() => {
     markQuitAllowed();
     void runEffect(
-      Effect.gen(function* () {
-        const electronApp = yield* ElectronApp.ElectronApp;
-        yield* electronApp.quit;
-      }).pipe(Effect.withSpan("desktop.lifecycle.quitAfterShutdown")),
+      leaveAfterShutdown(shutdownFinished).pipe(
+        Effect.withSpan("desktop.lifecycle.quitAfterShutdown"),
+      ),
     );
   });
 }
@@ -148,13 +202,11 @@ function quitFromSignal(
   void runEffect(
     Effect.gen(function* () {
       yield* Effect.annotateCurrentSpan({ signal });
-      const electronApp = yield* ElectronApp.ElectronApp;
       const state = yield* DesktopState.DesktopState;
       const wasQuitting = yield* Ref.getAndSet(state.quitting, true);
       if (wasQuitting) return;
       yield* logLifecycleInfo("process signal received", { signal });
-      yield* requestDesktopShutdownAndWait();
-      yield* electronApp.quit;
+      yield* leaveAfterShutdown(yield* requestDesktopShutdownAndWait());
     }).pipe(Effect.withSpan("desktop.lifecycle.processSignal")),
   );
 }

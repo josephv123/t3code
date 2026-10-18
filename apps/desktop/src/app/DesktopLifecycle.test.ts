@@ -1,8 +1,13 @@
 import { assert, describe, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
+import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
+import * as References from "effect/References";
+import * as TestClock from "effect/testing/TestClock";
 
 import type * as Electron from "electron";
 
@@ -18,6 +23,7 @@ import * as DesktopWindow from "../window/DesktopWindow.ts";
 function layerElectronApp(
   appListeners: Map<string, (...args: readonly unknown[]) => void>,
   quit: Effect.Effect<void> = Effect.void,
+  exit: (code: number) => Effect.Effect<void> = () => Effect.void,
 ) {
   const registerListener = (eventName: string, listener: (...args: readonly unknown[]) => void) =>
     Effect.acquireRelease(
@@ -37,7 +43,7 @@ function layerElectronApp(
     whenReady: Effect.void,
     requestSingleInstanceLock: Effect.succeed(true),
     quit,
-    exit: () => Effect.void,
+    exit,
     relaunch: () => Effect.void,
     setPath: () => Effect.void,
     setName: () => Effect.void,
@@ -169,6 +175,10 @@ describe("DesktopLifecycle", () => {
       const quit = Effect.sync(() => {
         events.push("quit");
       }).pipe(Effect.andThen(Deferred.succeed(quitRequested, undefined)), Effect.asVoid);
+      const exit = (code: number) =>
+        Effect.sync(() => {
+          events.push(`exit ${code}`);
+        });
       const destroyAll = Effect.sync(() => {
         events.push("destroy");
       });
@@ -192,7 +202,7 @@ describe("DesktopLifecycle", () => {
       } as DesktopEnvironment.DesktopEnvironment["Service"]);
 
       const layer = DesktopLifecycle.layer.pipe(
-        Layer.provideMerge(layerElectronApp(appListeners, quit)),
+        Layer.provideMerge(layerElectronApp(appListeners, quit, exit)),
         Layer.provideMerge(layerElectronTheme),
         Layer.provideMerge(layerElectronWindow(destroyAll)),
         Layer.provideMerge(layerDesktopWindow({ flushMainWindowBounds })),
@@ -218,6 +228,91 @@ describe("DesktopLifecycle", () => {
           assert.deepEqual(events, ["flush", "destroy", "request", "quit"]);
         }),
       ).pipe(Effect.provide(layer));
+    }),
+  );
+
+  it.effect.each([
+    { stuckOn: "flushMainWindowBounds", step: "saving window bounds" },
+    { stuckOn: "awaitComplete", step: "stopping backends and services" },
+  ] as const)("exits at the shutdown deadline when $stuckOn never finishes", ({ stuckOn, step }) =>
+    Effect.gen(function* () {
+      const appListeners = new Map<string, (...args: readonly unknown[]) => void>();
+      const stepReached = yield* Deferred.make<void>();
+      const shutdownRequested = yield* Deferred.make<void>();
+      const exitCode = yield* Deferred.make<number>();
+      const warnings = yield* Queue.unbounded<Record<string, unknown>>();
+      let quitCount = 0;
+
+      const stuck = Deferred.succeed(stepReached, undefined).pipe(Effect.andThen(Effect.never));
+      const layerDesktopShutdown = Layer.succeed(DesktopShutdown.DesktopShutdown, {
+        request: Deferred.succeed(shutdownRequested, undefined).pipe(Effect.asVoid),
+        awaitRequest: Deferred.await(shutdownRequested),
+        markComplete: Effect.void,
+        awaitComplete: stuckOn === "awaitComplete" ? stuck : Effect.void,
+        isComplete: Effect.succeed(false),
+      });
+      const layerEnvironment = Layer.succeed(DesktopEnvironment.DesktopEnvironment, {
+        platform: "darwin",
+        isDevelopment: false,
+      } as DesktopEnvironment.DesktopEnvironment["Service"]);
+      const logger = Logger.make(({ logLevel, fiber }) => {
+        if (logLevel === "Warn") {
+          Queue.offerUnsafe(warnings, fiber.getRef(References.CurrentLogAnnotations));
+        }
+      });
+
+      const layer = DesktopLifecycle.layer.pipe(
+        Layer.provideMerge(
+          layerElectronApp(
+            appListeners,
+            Effect.sync(() => {
+              quitCount += 1;
+            }),
+            (code) => Deferred.succeed(exitCode, code).pipe(Effect.asVoid),
+          ),
+        ),
+        Layer.provideMerge(layerElectronTheme),
+        Layer.provideMerge(layerElectronWindow()),
+        Layer.provideMerge(
+          layerDesktopWindow({
+            flushMainWindowBounds: stuckOn === "flushMainWindowBounds" ? stuck : Effect.void,
+          }),
+        ),
+        Layer.provideMerge(layerEnvironment),
+        Layer.provideMerge(layerDesktopShutdown),
+        Layer.provideMerge(DesktopState.layer),
+      );
+
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const lifecycle = yield* DesktopLifecycle.DesktopLifecycle;
+          yield* lifecycle.register;
+
+          appListeners.get("before-quit")?.({ preventDefault: () => undefined } as Electron.Event);
+          yield* Deferred.await(stepReached);
+
+          // A slow but healthy shutdown keeps the whole deadline.
+          yield* TestClock.adjust(
+            Duration.subtract(DesktopLifecycle.SHUTDOWN_DEADLINE, Duration.millis(1)),
+          );
+          assert.equal(yield* Queue.size(warnings), 0);
+
+          yield* TestClock.adjust(Duration.millis(1));
+          const warning = yield* Queue.take(warnings);
+          assert.equal(warning.component, "desktop-lifecycle");
+          assert.equal(warning.step, step);
+
+          yield* TestClock.adjust(DesktopLifecycle.SHUTDOWN_DEADLINE_LOG_FLUSH);
+          assert.equal(yield* Deferred.await(exitCode), 0);
+          assert.equal(quitCount, 0);
+          assert.isTrue(
+            yield* Deferred.isDone(shutdownRequested),
+            "backends get their stop request even when an earlier step is stuck",
+          );
+        }),
+      ).pipe(
+        Effect.provide(Layer.mergeAll(layer, Logger.layer([logger], { mergeWithExisting: false }))),
+      );
     }),
   );
 
