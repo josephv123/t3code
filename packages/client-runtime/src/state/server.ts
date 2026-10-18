@@ -12,6 +12,7 @@ import * as Cause from "effect/Cause";
 import * as Duration from "effect/Duration";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Equal from "effect/Equal";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
@@ -383,10 +384,15 @@ export const makeEnvironmentServerConfigState = Effect.fn("EnvironmentServerConf
     const persistence = yield* Queue.sliding<ServerConfig>(1);
     const pendingPersistence = yield* Ref.make<Option.Option<ServerConfig>>(Option.none());
 
+    let lastPersisted: ServerConfig | undefined;
     const persist = Effect.fn("EnvironmentServerConfigState.persist")(function* (
       config: ServerConfig,
     ) {
-      return yield* cache.saveServerConfig(environmentId, withoutEnvironmentThemes(config)).pipe(
+      const stored = withoutEnvironmentThemes(config);
+      // Theme and usage-limit source pushes only change fields the cache drops, and every
+      // reconnect re-sends the whole config.
+      if (lastPersisted !== undefined && Equal.equals(lastPersisted, stored)) return true;
+      const saved = yield* cache.saveServerConfig(environmentId, stored).pipe(
         Effect.as(true),
         Effect.catch((error) =>
           Effect.logWarning("Could not persist cached server configuration.").pipe(
@@ -398,6 +404,8 @@ export const makeEnvironmentServerConfigState = Effect.fn("EnvironmentServerConf
           ),
         ),
       );
+      if (saved) lastPersisted = stored;
+      return saved;
     });
 
     const persistPending = Effect.fn("EnvironmentServerConfigState.persistPending")(function* (

@@ -1,8 +1,8 @@
 import {
+  OrchestrationProjectShell,
   OrchestrationV2ThreadShell,
   RepositoryIdentity,
   ThreadPullRequestLink,
-  type OrchestrationProjectShell,
   type OrchestrationV2ShellSnapshot,
   type OrchestrationV2ShellStreamItem,
 } from "@t3tools/contracts";
@@ -13,12 +13,43 @@ const sameLinks = Schema.toEquivalence(Schema.UndefinedOr(Schema.Array(ThreadPul
 const sameRepositoryIdentity = Schema.toEquivalence(
   Schema.UndefinedOr(Schema.NullOr(RepositoryIdentity)),
 );
+const sameProjectShells = Schema.toEquivalence(Schema.Array(OrchestrationProjectShell));
 
 export function sameThreadPullRequests(
   left: OrchestrationV2ThreadShell["pullRequests"],
   right: OrchestrationV2ThreadShell["pullRequests"],
 ): boolean {
   return left === right || sameLinks(left, right);
+}
+
+function sameThreadShellsById(
+  previous: ReadonlyArray<OrchestrationV2ThreadShell>,
+  next: ReadonlyArray<OrchestrationV2ThreadShell>,
+): boolean {
+  if (previous === next) return true;
+  if (previous.length !== next.length) return false;
+  const previousById = new Map(previous.map((thread) => [thread.id, thread] as const));
+  return next.every((thread) => {
+    const prior = previousById.get(thread.id);
+    return prior !== undefined && sameThreadShell(prior, thread);
+  });
+}
+
+/**
+ * Whether saving `next` would store the same rows as `previous`. The cursor is left out because
+ * every new session reloads the shell before it resumes, so a saved cursor is never read. Row
+ * order is left out because a reconnect snapshot can list unchanged rows in another order.
+ */
+export function sameShellCacheContent(
+  previous: OrchestrationV2ShellSnapshot,
+  next: OrchestrationV2ShellSnapshot,
+): boolean {
+  return (
+    previous.schemaVersion === next.schemaVersion &&
+    sameThreadShellsById(previous.threads, next.threads) &&
+    sameThreadShellsById(previous.archivedThreads, next.archivedThreads) &&
+    sameProjectShells(previous.projects, next.projects)
+  );
 }
 
 /**

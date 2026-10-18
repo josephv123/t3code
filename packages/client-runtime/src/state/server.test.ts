@@ -922,4 +922,86 @@ describe("server state projection", () => {
       expect(yield* Queue.poll(savedConfigs)).toEqual(Option.none());
     }),
   );
+
+  it.effect("does not rewrite server configuration when the stored value is unchanged", () =>
+    Effect.gen(function* () {
+      const events = yield* Queue.unbounded<ServerConfigStreamEvent>();
+      const client = {
+        [WS_METHODS.subscribeServerConfig]: () => Stream.fromQueue(events),
+      } as unknown as WsRpcProtocolClient;
+      const supervisor = EnvironmentSupervisor.EnvironmentSupervisor.of({
+        target: TARGET,
+        state: yield* SubscriptionRef.make(AVAILABLE_CONNECTION_STATE),
+        session: yield* SubscriptionRef.make(Option.some(session(client))),
+        prepared: yield* SubscriptionRef.make(Option.none<PreparedConnection>()),
+        connect: Effect.void,
+        disconnect: Effect.void,
+        retryNow: Effect.void,
+      } satisfies EnvironmentSupervisor.EnvironmentSupervisor["Service"]);
+      const savedConfigs = yield* Queue.unbounded<ServerConfig>();
+      const cache = Persistence.EnvironmentCacheStore.of({
+        loadShell: () => Effect.succeedNone,
+        saveShell: () => Effect.void,
+        loadThread: () => Effect.succeedNone,
+        saveThread: () => Effect.void,
+        removeThread: () => Effect.void,
+        loadServerConfig: () => Effect.succeedNone,
+        saveServerConfig: (_environmentId, config) => Queue.offer(savedConfigs, config),
+        loadVcsRefs: () => Effect.succeedNone,
+        saveVcsRefs: () => Effect.void,
+        removeVcsRefs: () => Effect.void,
+        clearVcsRefs: () => Effect.void,
+        clear: () => Effect.void,
+      });
+      // Like a decoded reconnect snapshot: equal values, new objects, a Duration in settings.
+      const configSnapshot = (cwd: string) =>
+        snapshotEvent({
+          ...CONFIG,
+          cwd,
+          settings: { providerHealthRefreshInterval: Duration.minutes(5) },
+        } as unknown as ServerConfig);
+      const themesUpdated = (name: string): ServerConfigStreamEvent => ({
+        version: 1,
+        type: "environmentThemesUpdated",
+        payload: {
+          themes: [
+            { id: "nightfall", name, appearance: "dark", canvas: "#1a1b26", accent: "#7aa2f7" },
+          ],
+        },
+      });
+
+      const scope = yield* Scope.make();
+      const state = yield* makeEnvironmentServerConfigState({ environmentThemes: true }).pipe(
+        Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+        Effect.provideService(Persistence.EnvironmentCacheStore, cache),
+        Effect.provideService(Scope.Scope, scope),
+      );
+      const send = Effect.fn(function* (event: ServerConfigStreamEvent) {
+        yield* Queue.offer(events, event);
+        yield* SubscriptionRef.changes(state).pipe(
+          Stream.filter((value) => Option.isSome(value) && value.value.latestEvent === event),
+          Stream.runHead,
+        );
+      });
+
+      yield* send(configSnapshot("/repo"));
+      yield* TestClock.adjust("500 millis");
+      expect((yield* Queue.take(savedConfigs)).cwd).toBe("/repo");
+
+      // The cache drops published themes, and a reconnect re-sends an equal snapshot.
+      yield* send(themesUpdated("Nightfall"));
+      yield* TestClock.adjust("10 seconds");
+      yield* send(configSnapshot("/repo"));
+      yield* TestClock.adjust("10 seconds");
+      expect(yield* Queue.poll(savedConfigs)).toEqual(Option.none());
+
+      yield* send(configSnapshot("/other"));
+      yield* TestClock.adjust("10 seconds");
+      expect((yield* Queue.take(savedConfigs)).cwd).toBe("/other");
+
+      yield* send(themesUpdated("Daybreak"));
+      yield* Scope.close(scope, Exit.void);
+      expect(yield* Queue.poll(savedConfigs)).toEqual(Option.none());
+    }),
+  );
 });

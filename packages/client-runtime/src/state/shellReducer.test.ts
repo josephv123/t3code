@@ -6,6 +6,7 @@ import {
   applyShellStreamEvent,
   mergeShellSnapshotProjects,
   reuseUnchangedThreadShells,
+  sameShellCacheContent,
 } from "./shellReducer.ts";
 
 const repositoryIdentity = {
@@ -560,5 +561,33 @@ describe("reuseUnchangedThreadShells", () => {
     const next = reuseUnchangedThreadShells({ ...v2ShellSnapshot, threads: [linked] }, incoming);
     expect(next).toBe(incoming);
     expect(next.threads[0]?.pullRequests).toBe(updated.pullRequests);
+  });
+});
+
+describe("sameShellCacheContent", () => {
+  const rows = ["a", "b"].map((id) => ({ ...v2ThreadShell, id: ThreadId.make(id) }));
+  const saved = { ...v2ShellSnapshot, snapshotSequence: 3, threads: rows };
+
+  it("ignores the cursor and the order of equal rows", () => {
+    expect(sameShellCacheContent(saved, { ...saved, snapshotSequence: 9 })).toBe(true);
+    expect(
+      sameShellCacheContent(saved, { ...saved, threads: [{ ...rows[1]! }, { ...rows[0]! }] }),
+    ).toBe(true);
+  });
+
+  it("detects a changed, replaced or removed row and a changed project", () => {
+    expect(
+      sameShellCacheContent(saved, { ...saved, threads: [rows[0]!, { ...rows[1]!, title: "B" }] }),
+    ).toBe(false);
+    expect(
+      sameShellCacheContent(saved, {
+        ...saved,
+        threads: [rows[0]!, { ...v2ThreadShell, id: ThreadId.make("c") }],
+      }),
+    ).toBe(false);
+    expect(sameShellCacheContent(saved, { ...saved, threads: rows.slice(1) })).toBe(false);
+    expect(
+      sameShellCacheContent(saved, { ...saved, projects: [{ ...v2Project, title: "Renamed" }] }),
+    ).toBe(false);
   });
 });

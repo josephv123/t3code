@@ -34,6 +34,7 @@ import {
   applyShellStreamEvent,
   mergeShellSnapshotProjects,
   reuseUnchangedThreadShells,
+  sameShellCacheContent,
   sameThreadPullRequests,
 } from "./shellReducer.ts";
 import { type EnvironmentCatalogState, enabledEnvironmentIds } from "./connections.ts";
@@ -111,16 +112,19 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
       if (Option.isNone(latest) || latest.value === lastPersisted) return;
       if (latest.value.threads.some((thread) => pendingLinkRows.has(thread))) return;
       const snapshot = latest.value;
-      const saved = yield* cache.saveShell(environmentId, snapshot).pipe(
-        Effect.as(true),
-        Effect.catch((error) =>
-          Effect.logWarning("Could not persist environment shell cache.").pipe(
-            Effect.annotateLogs({ environmentId, ...safeErrorLogAttributes(error) }),
-            Effect.as(false),
+      // An unchanged row still moves the cursor, and a reconnect snapshot re-sends every row.
+      if (lastPersisted === undefined || !sameShellCacheContent(lastPersisted, snapshot)) {
+        const saved = yield* cache.saveShell(environmentId, snapshot).pipe(
+          Effect.as(true),
+          Effect.catch((error) =>
+            Effect.logWarning("Could not persist environment shell cache.").pipe(
+              Effect.annotateLogs({ environmentId, ...safeErrorLogAttributes(error) }),
+              Effect.as(false),
+            ),
           ),
-        ),
-      );
-      if (!saved) return;
+        );
+        if (!saved) return;
+      }
       lastPersisted = snapshot;
       if (!flush) return;
     }

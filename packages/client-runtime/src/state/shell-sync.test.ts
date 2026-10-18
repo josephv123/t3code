@@ -3,6 +3,7 @@ import {
   ORCHESTRATION_V2_WS_METHODS,
   type OrchestrationV2ShellSnapshot,
   type OrchestrationV2ShellStreamItem,
+  type OrchestrationV2ThreadShell,
   ThreadId,
   type ThreadPullRequestLink,
 } from "@t3tools/contracts";
@@ -64,6 +65,89 @@ function session(client: WsRpcProtocolClient): RpcSession.RpcSession {
     closed: Effect.never,
   };
 }
+
+/**
+ * A live shell fed one stream item at a time, with a cache that records each saved cursor and a
+ * client that records each subscription's resume cursor.
+ */
+const makeRecordingShell = Effect.fn(function* (cached?: OrchestrationV2ShellSnapshot) {
+  const events = yield* Queue.unbounded<OrchestrationV2ShellStreamItem>();
+  const savedSequences = yield* Ref.make<ReadonlyArray<number>>([]);
+  const resumeCursors = yield* SubscriptionRef.make<ReadonlyArray<number | undefined>>([]);
+  const client = {
+    [ORCHESTRATION_V2_WS_METHODS.subscribeShell]: (input: { readonly afterSequence?: number }) =>
+      Stream.unwrap(
+        SubscriptionRef.update(resumeCursors, (cursors) => [...cursors, input.afterSequence]).pipe(
+          Effect.as(Stream.fromQueue(events)),
+        ),
+      ),
+  } as unknown as WsRpcProtocolClient;
+  const supervisorState = yield* SubscriptionRef.make(AVAILABLE_CONNECTION_STATE);
+  const supervisor = EnvironmentSupervisor.EnvironmentSupervisor.of({
+    target: TARGET,
+    state: supervisorState,
+    session: yield* SubscriptionRef.make(Option.some(session(client))),
+    prepared: yield* SubscriptionRef.make(Option.some(PREPARED)),
+    connect: Effect.void,
+    disconnect: Effect.void,
+    retryNow: Effect.void,
+  } satisfies EnvironmentSupervisor.EnvironmentSupervisor["Service"]);
+  const cache = Persistence.EnvironmentCacheStore.of({
+    loadShell: () => Effect.succeed(Option.fromUndefinedOr(cached)),
+    saveShell: (_environmentId, snapshot) =>
+      Ref.update(savedSequences, (sequences) => [...sequences, snapshot.snapshotSequence]),
+    loadThread: () => Effect.succeedNone,
+    saveThread: () => Effect.void,
+    removeThread: () => Effect.void,
+    loadServerConfig: () => Effect.succeedNone,
+    saveServerConfig: () => Effect.void,
+    loadVcsRefs: () => Effect.succeedNone,
+    saveVcsRefs: () => Effect.void,
+    removeVcsRefs: () => Effect.void,
+    clearVcsRefs: () => Effect.void,
+    clear: () => Effect.void,
+  });
+  const shellState = yield* makeEnvironmentShellState().pipe(
+    Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+    Effect.provideService(Persistence.EnvironmentCacheStore, cache),
+    Effect.provideService(
+      ShellSnapshotLoader.ShellSnapshotLoader,
+      ShellSnapshotLoader.ShellSnapshotLoader.of({ load: () => Effect.succeedNone }),
+    ),
+  );
+  const currentSnapshot = SubscriptionRef.get(shellState).pipe(
+    Effect.map((state) => Option.getOrUndefined(state.snapshot)),
+  );
+  return {
+    savedSequences: Ref.get(savedSequences),
+    firstResumeCursors: SubscriptionRef.changes(resumeCursors).pipe(
+      Stream.filter((cursors) => cursors.length > 0),
+      Stream.runHead,
+      Effect.map(Option.getOrThrow),
+    ),
+    // Waits for the item to replace the snapshot; a metadata re-send keeps the cursor.
+    send: Effect.fn(function* (item: OrchestrationV2ShellStreamItem) {
+      const before = yield* currentSnapshot;
+      yield* Queue.offer(events, item);
+      yield* SubscriptionRef.changes(shellState).pipe(
+        Stream.filter((state) => Option.getOrUndefined(state.snapshot) !== before),
+        Stream.runHead,
+      );
+    }),
+    disconnect: SubscriptionRef.set(supervisorState, {
+      ...AVAILABLE_CONNECTION_STATE,
+      desired: false,
+    }).pipe(
+      Effect.andThen(
+        SubscriptionRef.changes(shellState).pipe(
+          Stream.filter((state) => state.status === "cached"),
+          Stream.runHead,
+        ),
+      ),
+      Effect.andThen(TestClock.adjust("0 millis")),
+    ),
+  };
+});
 
 describe("environment shell synchronization", () => {
   it.effect("publishes live state before persistence and preserves it when ready", () =>
@@ -491,10 +575,15 @@ describe("environment shell synchronization", () => {
         Effect.provideService(ShellSnapshotLoader.ShellSnapshotLoader, snapshotLoader),
       );
 
+      // Each snapshot renames the row: one that only moves the cursor has nothing new to save.
       const sendSnapshot = Effect.fn(function* (sequence: number) {
         yield* Queue.offer(events, {
           kind: "snapshot",
-          snapshot: { ...LIVE_SHELL_SNAPSHOT, snapshotSequence: sequence },
+          snapshot: {
+            ...LIVE_SHELL_SNAPSHOT,
+            snapshotSequence: sequence,
+            threads: [{ ...v2ThreadShell, title: `Thread ${sequence}` }],
+          },
         });
         yield* SubscriptionRef.changes(shellState).pipe(
           Stream.filter(
@@ -526,6 +615,77 @@ describe("environment shell synchronization", () => {
       expect((yield* Ref.get(saved)).map((snapshot) => snapshot.snapshotSequence)).toEqual([
         1, 10, 11,
       ]);
+    }),
+  );
+
+  // Skipping saves that only move the cursor relies on this: a saved cursor is never resumed from.
+  it.effect("does not resume a new session from the saved cursor", () =>
+    Effect.gen(function* () {
+      const shell = yield* makeRecordingShell({ ...LIVE_SHELL_SNAPSHOT, snapshotSequence: 5 });
+      expect(yield* shell.firstResumeCursors).toEqual([undefined]);
+    }),
+  );
+
+  it.effect("does not rewrite the shell cache when an unchanged row only moves the cursor", () =>
+    Effect.gen(function* () {
+      const shell = yield* makeRecordingShell();
+      const row = LIVE_SHELL_SNAPSHOT.threads[0]!;
+      const rowUpdate = (sequence: number, thread: OrchestrationV2ThreadShell) =>
+        ({ kind: "thread.updated", sequence, location: "active", thread }) as const;
+
+      yield* shell.send({ kind: "snapshot", snapshot: LIVE_SHELL_SNAPSHOT });
+      yield* TestClock.adjust("500 millis");
+      yield* shell.send(rowUpdate(2, { ...row }));
+      yield* TestClock.adjust("10 seconds");
+      expect(yield* shell.savedSequences).toEqual([1]);
+
+      const renamed = { ...row, title: "Renamed" };
+      yield* shell.send(rowUpdate(3, renamed));
+      yield* TestClock.adjust("10 seconds");
+      expect(yield* shell.savedSequences).toEqual([1, 3]);
+
+      yield* shell.send(rowUpdate(4, { ...renamed }));
+      yield* shell.disconnect;
+      expect(yield* shell.savedSequences).toEqual([1, 3]);
+    }),
+  );
+
+  // Every time the window becomes visible, the shell resumes and the server re-sends project metadata.
+  it.effect("does not rewrite the shell cache when a resume re-sends unchanged projects", () =>
+    Effect.gen(function* () {
+      const shell = yield* makeRecordingShell();
+      yield* shell.send({ kind: "snapshot", snapshot: LIVE_SHELL_SNAPSHOT });
+      yield* TestClock.adjust("500 millis");
+      yield* shell.send({
+        kind: "snapshot",
+        snapshot: { ...LIVE_SHELL_SNAPSHOT, threads: [], projects: [{ ...v2Project }] },
+        resolvedRepositoryIdentityRoots: [v2Project.workspaceRoot],
+      });
+      yield* TestClock.adjust("10 seconds");
+      expect(yield* shell.savedSequences).toEqual([1]);
+    }),
+  );
+
+  it.effect("does not rewrite the shell cache when a snapshot re-sends its rows reordered", () =>
+    Effect.gen(function* () {
+      const shell = yield* makeRecordingShell();
+      const first = { ...v2ThreadShell, id: ThreadId.make("thread-a") };
+      const second = { ...v2ThreadShell, id: ThreadId.make("thread-b") };
+      const snapshot = (sequence: number, threads: ReadonlyArray<OrchestrationV2ThreadShell>) =>
+        ({
+          kind: "snapshot",
+          snapshot: { ...LIVE_SHELL_SNAPSHOT, snapshotSequence: sequence, threads },
+        }) as const;
+
+      yield* shell.send(snapshot(1, [first, second]));
+      yield* TestClock.adjust("500 millis");
+      yield* shell.send(snapshot(2, [{ ...second }, { ...first }]));
+      yield* TestClock.adjust("10 seconds");
+      expect(yield* shell.savedSequences).toEqual([1]);
+
+      yield* shell.send(snapshot(3, [{ ...second, title: "Renamed" }, first]));
+      yield* TestClock.adjust("10 seconds");
+      expect(yield* shell.savedSequences).toEqual([1, 3]);
     }),
   );
 
